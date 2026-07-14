@@ -590,10 +590,10 @@ tag_blocks AS (
 object_blocks AS (
     SELECT
         o.object_name,
-        '*** ' || o.object_name || CHAR(10) ||
+        '--- ' || o.object_name || CHAR(10) ||
         COALESCE(
             (SELECT GROUP_CONCAT(
-                '****[#' ||
+                '----[#' ||
                 COALESCE(
                     (SELECT color FROM vw_swagger_datatype_color WHERE datatype = f.raw_datatype),
                     (SELECT color FROM vw_swagger_datatype_color WHERE datatype = 'default')
@@ -603,7 +603,7 @@ object_blocks AS (
              FROM (SELECT field_name, raw_datatype FROM vw_swagger_field f
                    WHERE f.object_name = o.object_name
                    ORDER BY f.sort_order, f.field_name) f),
-            '**** (no fields)'
+            '---- (no fields)'
         ) AS block
     FROM vw_swagger_object o
 )
@@ -615,7 +615,7 @@ SELECT
     (SELECT GROUP_CONCAT(block, CHAR(10))
      FROM (SELECT block FROM tag_blocks ORDER BY tag)) || CHAR(10) ||
  
-    '** Data Model' || CHAR(10) ||
+    '-- Data Model' || CHAR(10) ||
     (SELECT GROUP_CONCAT(block, CHAR(10))
      FROM (SELECT block FROM object_blocks ORDER BY object_name)) || CHAR(10) ||
  
