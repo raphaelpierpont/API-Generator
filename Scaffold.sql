@@ -532,8 +532,8 @@ ON CONFLICT(datatype) DO UPDATE SET sort_order=excluded.sort_order, color=exclud
 -- is indentation/depth-marker driven, so it has to be real text with
 -- real line breaks, not something a generic JSON/string function emits.
 -- ==========================================================
-DROP VIEW IF EXISTS vw_mindmap_planuml;
-CREATE VIEW vw_mindmap_planuml AS
+DROP VIEW IF EXISTS vw_mindmap_plantuml;
+CREATE VIEW vw_mindmap_plantuml AS
 WITH title_line AS (
     SELECT
         (SELECT info_value FROM vw_swagger_info WHERE info_key = 'title') ||
@@ -648,7 +648,7 @@ CREATE VIEW vw_mindmap_text AS
   ),
   do_replace(id, current_text, step) AS (
      -- Base case: Grab the initial mindmap text
-     SELECT 0, mindmap, 1 FROM vw_mindmap_planuml
+     SELECT 0, mindmap, 1 FROM vw_mindmap_plantuml
      UNION ALL
      -- Recursive case: Apply replacements one step at a time
      SELECT d.id, REPLACE(d.current_text, p.find_str, p.replace_str), d.step + 1
@@ -661,3 +661,122 @@ CREATE VIEW vw_mindmap_text AS
      WHERE step = (SELECT COUNT(*) + 1 FROM pairs)
   )
 SELECT current_text AS mindmap FROM final_trans;
+
+DROP VIEW IF EXISTS vw_planuml_dependency;
+CREATE VIEW vw_planuml_dependency AS
+
+SELECT '@startuml' 
+UNION ALL
+SELECT DISTINCT '[' || m.name || '] ' 
+FROM sqlite_master m WHERE m.type='table'
+UNION ALL
+SELECT '[' || m.name || '] --> [' || fk."table" || '] : ' || fk."from" || ' -> ' || fk."to"
+FROM sqlite_master m
+JOIN pragma_foreign_key_list(m.name) fk
+WHERE m.type = 'table'
+UNION ALL
+SELECT '@enduml';
+
+DROP VIEW IF EXISTS vw_create_esql;
+CREATE VIEW vw_create_esql AS
+
+WITH esql_source(datatype, source_expr) AS (
+VALUES
+ ('header','TRIM(InputRoot.HTTPInputHeader.?)')
+,('query','TRIM(InputLocalEnvironment.REST.Input.Parameters.?)')
+,('body','TRIM(InputRoot.JSON.Data.?)')
+,('path','TRIM(InputLocalEnvironment.REST.Input.Parameters.?)')
+),
+declarations AS (
+    SELECT
+        '        DECLARE ' || sp.parameter_name || ' CHARACTER ' ||
+        REPLACE(es.source_expr, '?', sp.parameter_name) || ';' AS decl_line,
+        '            ' || sp.parameter_name AS call_arg,
+        sp.path, sp.http_method, sp.sort_order
+    FROM vw_swagger_parameter sp
+    JOIN esql_source es ON es.datatype = sp.parameter_in
+),
+params AS (
+    SELECT
+        REPLACE(REPLACE(REPLACE(TRIM(path,'/'), '/', '_'), '{', ''), '}', '') || '_' || http_method AS proc_name,
+        path, http_method,
+        GROUP_CONCAT(decl_line, CHAR(10)) AS decls,
+        GROUP_CONCAT(call_arg, ',' || CHAR(10)) AS call_args
+    FROM declarations
+    GROUP BY path, http_method
+)
+SELECT
+     proc_name AS named,
+    '    CREATE FUNCTION Main() RETURNS BOOLEAN' || CHAR(10) ||
+    '    BEGIN' || CHAR(10) ||
+    '        DECLARE statusCode INTEGER;' || CHAR(10) ||
+    '        DECLARE responseBody CHARACTER ''{"message":"No content."}'';' || CHAR(10) ||
+    decls || CHAR(10) ||
+    '        -- Call the stored procedure' || CHAR(10) ||
+    '        CALL "' || proc_name || '"(' || CHAR(10) ||
+    '            statusCode,' || CHAR(10) ||
+    '            responseBody,' || CHAR(10) ||
+    call_args || CHAR(10) ||
+    '        );' || CHAR(10) ||
+    '        -- Set HTTP headers' || CHAR(10) ||
+    '        SET OutputRoot.HTTPResponseHeader."Content-Type" = ''application/json'';' || CHAR(10) ||
+    '        SET OutputLocalEnvironment.Destination.HTTP.ReplyStatusCode = statusCode;' || CHAR(10) ||
+    '        DECLARE dataAsBit BIT CAST(COALESCE(responseBody,''{"message":"No content."}'') AS BIT CCSID 1208);' || CHAR(10) ||
+    '        CREATE LASTCHILD OF OutputRoot DOMAIN ''JSON'' PARSE(dataAsBit CCSID 1208);' || CHAR(10) ||
+    '        RETURN TRUE;' || CHAR(10) ||
+    '    END;' || CHAR(10) ||
+    '    -- EXTERNAL NAME must match your DSN and DB name, schema, and proc name' || CHAR(10) ||
+    '    CREATE PROCEDURE "' || proc_name || '" (' || CHAR(10) ||
+    '        INOUT statusCode INTEGER,' || CHAR(10) ||
+    '        INOUT responseBody CHARACTER,' || CHAR(10) ||
+    call_args || ' CHARACTER' || CHAR(10) ||
+    '    )' || CHAR(10) ||
+    '    LANGUAGE DATABASE' || CHAR(10) ||
+    '    EXTERNAL NAME "dbo.' || proc_name || '"; -- Adjust to your actual DSN' || CHAR(10) ||
+    'END MODULE;' AS ESQL
+FROM params
+;
+
+DROP VIEW IF EXISTS vw_create_storedprocedure;
+CREATE VIEW vw_create_storedprocedure AS
+
+WITH sql_types(swagger_type, sql_type) AS (
+VALUES
+ ('integer','INT')
+,('number','FLOAT')
+,('boolean','BIT')
+,('string','VARCHAR(50)')
+),
+params AS (
+    SELECT
+        '    @' || sp.parameter_name || ' ' || st.sql_type
+        || CASE WHEN sp.required = 1 THEN '' ELSE ' = NULL' END
+        || ' -- ' || sp.description AS line,
+        sp.parameter_name || ' -- '|| sp.description AS param,
+        sp.path, sp.http_method, sp.sort_order
+    FROM vw_swagger_parameter sp
+    JOIN sql_types st ON st.swagger_type = sp.swagger_type
+)
+SELECT REPLACE(REPLACE(REPLACE(TRIM(path,'/'), '/', '_'), '{', ''), '}', '') || '_' || http_method AS named,
+    'CREATE OR ALTER PROCEDURE [dbo].[' ||
+    REPLACE(REPLACE(REPLACE(TRIM(path,'/'), '/', '_'), '{', ''), '}', '') ||
+    '_' || http_method || ']' || CHAR(10) ||
+    '(' || CHAR(10) ||
+    '    @status_code INT OUTPUT,' || CHAR(10) ||
+    '    @body NVARCHAR(4000) OUTPUT,' || CHAR(10) ||
+    GROUP_CONCAT(line, ',' || CHAR(10)) || CHAR(10) ||
+    ')' || CHAR(10) ||
+    'AS' || CHAR(10) ||
+    'BEGIN' || CHAR(10) ||
+    '    SET NOCOUNT ON;' || CHAR(10) ||CHAR(10) ||
+    '    -- your code here' || CHAR(10) ||
+    '    SELECT ' || CHAR(10) ||
+    '        @status_code as status' || CHAR(10) ||
+    '       ,@body as body' || CHAR(10) ||
+    GROUP_CONCAT('       ,' ||param,  CHAR(10))|| CHAR(10) ||CHAR(10) ||
+    '    SET @status_code = 200;' || CHAR(10) ||
+    '    SET @body = ''{}'';' || CHAR(10) ||
+    'END' AS SP
+FROM params
+GROUP BY path, http_method
+;
